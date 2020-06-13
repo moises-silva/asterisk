@@ -283,6 +283,9 @@ int AST_OPTIONAL_API_NAME(ast_websocket_server_remove_protocol)(struct ast_webso
 	return 0;
 }
 
+/*! \brief Perform payload masking for client sessions */
+static void websocket_mask_payload(struct ast_websocket *session, char *frame, char *payload, uint64_t payload_size);
+
 /*! \brief Close function for websocket session */
 int AST_OPTIONAL_API_NAME(ast_websocket_close)(struct ast_websocket *session, uint16_t reason)
 {
@@ -299,6 +302,8 @@ int AST_OPTIONAL_API_NAME(ast_websocket_close)(struct ast_websocket *session, ui
 
 	/* If no reason has been specified assume 1000 which is normal closure */
 	put_unaligned_uint16(&frame[2], htons(reason ? reason : 1000));
+
+	websocket_mask_payload(session, frame, &frame[2], 2);
 
 	session->closing = 1;
 	session->close_sent = 1;
@@ -341,6 +346,23 @@ static const char *websocket_opcode2str(enum ast_websocket_opcode opcode)
 	}
 }
 
+static void websocket_mask_payload(struct ast_websocket *session, char *frame, char *payload, uint64_t payload_size)
+{
+	/* RFC 6455 5.1 - clients MUST mask frame data */
+	if (session->client) {
+		uint64_t i;
+		uint8_t mask_key_idx;
+		uint32_t mask_key = ast_random();
+		uint8_t length = frame[1] & 0x7f;
+		frame[1] |= 0x80; /* set mask bit to 1 */
+		mask_key_idx = length == 126 ? 4 : length == 127 ? 10 : 2;
+		put_unaligned_uint32(&frame[mask_key_idx], mask_key);
+		for (i = 0; i < payload_size; i++) {
+			payload[i] ^= ((char *)&mask_key)[i % 4];
+		}
+	}
+}
+
 /*! \brief Write function for websocket traffic */
 int AST_OPTIONAL_API_NAME(ast_websocket_write)(struct ast_websocket *session, enum ast_websocket_opcode opcode, char *payload, uint64_t payload_size)
 {
@@ -364,6 +386,11 @@ int AST_OPTIONAL_API_NAME(ast_websocket_write)(struct ast_websocket *session, en
 		header_size += 8;
 	}
 
+	if (session->client) {
+		/* Additional 4 bytes for the client mask key */
+		header_size += 4;
+	}
+
 	frame_size = header_size + payload_size;
 
 	frame = ast_alloca(frame_size + 1);
@@ -380,6 +407,8 @@ int AST_OPTIONAL_API_NAME(ast_websocket_write)(struct ast_websocket *session, en
 	}
 
 	memcpy(&frame[header_size], payload, payload_size);
+
+	websocket_mask_payload(session, frame, &frame[header_size], payload_size);
 
 	ao2_lock(session);
 	if (session->closing) {
